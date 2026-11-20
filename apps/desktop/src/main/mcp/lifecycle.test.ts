@@ -1,5 +1,13 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import http from 'node:http'
+import { readFileSync } from 'node:fs'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { AgentActivityService } from '../agent/activity'
+import { createActor } from '../state/actor'
+import { uuidV7Gen } from '../state/ids'
+import { blankProject, rootComposition } from '../state/model'
+import type { TsActorHost } from '../state/ts-actor-host'
 
 // `mcp/index.ts` reads `app.isPackaged` to decide whether to print the connect
 // snippet; packaged keeps the bearer token out of the test output.
@@ -60,6 +68,7 @@ function post(
   port: number,
   body: unknown,
   headers: Record<string, string>,
+  path = '/mcp',
 ): Promise<{ status: number; sessionId: string | undefined }> {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body)
@@ -67,7 +76,7 @@ function post(
       {
         host: '127.0.0.1',
         port,
-        path: '/mcp',
+        path,
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -86,6 +95,99 @@ function post(
     req.end(payload)
   })
 }
+
+describe('project MCP endpoints', () => {
+  function createProject(name: string) {
+    const idGen = uuidV7Gen()
+    const actor = createActor({ initial: blankProject(idGen, name), idGen, clock: () => '<TS>' })
+    const agent = new AgentActivityService(actor, vi.fn())
+    agent.start()
+    const host = {
+      actor, agent,
+      openedProject: () => ({ dir: `/projects/${name}` }),
+      mcpCall: (tool: string, args: string, client?: string) => actor.mcpCall(tool, args, client),
+    } satisfies Pick<TsActorHost, 'actor' | 'agent' | 'openedProject' | 'mcpCall'>
+    return {
+      host: host as TsActorHost, actor, agent,
+      trackLabels: () => rootComposition(actor.snapshot()).tracks.map(track => track.label),
+    }
+  }
+
+  async function connect(url: string, name: string) {
+    const client = new Client({ name, version: '1.0.0' })
+    const transport = new StreamableHTTPClientTransport(new URL(url), {
+      requestInit: { headers: { authorization: 'Bearer test-token' } },
+    })
+    await client.connect(transport)
+    return { client, transport }
+  }
+
+  it('keeps concurrent edits, undo, and disconnect on their original projects', async () => {
+    const catalog = readFileSync('fixtures/mcp/rust-catalog-snapshot.json', 'utf8')
+    const backend = { mcpCatalog: async () => catalog } as Backend
+    const host = await startMcpHost(backend)
+    hosts.push(host)
+    const first = createProject('first')
+    const second = createProject('second')
+    const firstEndpoint = host.registerProject(backend, first.host)
+    const secondEndpoint = host.registerProject(backend, second.host)
+    const [a, b] = await Promise.all([
+      connect(firstEndpoint.getInfo().url, 'first-agent'),
+      connect(secondEndpoint.getInfo().url, 'second-agent'),
+    ])
+
+    try {
+      const [sessionA, sessionB] = await Promise.all([
+        a.client.callTool({ name: 'begin_agent_session', arguments: { reason: 'Edit first' } }),
+        b.client.callTool({ name: 'begin_agent_session', arguments: { reason: 'Edit second' } }),
+      ])
+      expect(sessionA.isError).toBeFalsy()
+      expect(sessionB.isError).toBeFalsy()
+      const [editA, editB] = await Promise.all([
+        a.client.callTool({ name: 'add_track', arguments: { label: 'Track A' } }),
+        b.client.callTool({ name: 'add_track', arguments: { label: 'Track B' } }),
+      ])
+      expect(editA.isError).toBeFalsy()
+      expect(editB.isError).toBeFalsy()
+      expect(first.trackLabels()).toContain('Track A')
+      expect(first.trackLabels()).not.toContain('Track B')
+      expect(second.trackLabels()).toContain('Track B')
+      expect(second.trackLabels()).not.toContain('Track A')
+
+      const secondState = second.actor.snapshot()
+      const undo = await a.client.callTool({ name: 'undo' })
+      expect(undo.isError).toBeFalsy()
+      expect(first.trackLabels()).not.toContain('Track A')
+      expect(second.actor.snapshot()).toBe(secondState)
+
+      expect(firstEndpoint.connectionSnapshot().connections).toMatchObject([{ client: 'first-agent' }])
+      expect(secondEndpoint.connectionSnapshot().connections).toMatchObject([{ client: 'second-agent' }])
+      expect(host.connectionSnapshot().connections).toEqual([])
+      const targetA = new URL(firstEndpoint.getInfo().url)
+      const targetB = new URL(secondEndpoint.getInfo().url)
+      const sessionId = a.transport.sessionId!
+      const ping = { jsonrpc: '2.0', id: 9, method: 'ping' }
+      const headers = { authorization: 'Bearer test-token', 'mcp-session-id': sessionId }
+      expect((await post(Number(targetB.port), ping, headers, targetB.pathname)).status).toBe(400)
+
+      const reopen = await a.client.callTool({ name: 'open_project', arguments: { path: '/projects/second' } })
+      expect(reopen.structuredContent).toMatchObject({ error: 'ProjectConnectionBound' })
+
+      await firstEndpoint.close()
+      expect((await post(Number(targetA.port), ping, headers, targetA.pathname)).status).toBe(404)
+      expect((await post(Number(targetA.port), INITIALIZE, { authorization: 'Bearer test-token' }, targetA.pathname)).status).toBe(404)
+      expect(first.agent.snapshot().session).toBeNull()
+      expect(second.agent.snapshot().session?.reason).toBe('Edit second')
+      const edit = await b.client.callTool({ name: 'add_track', arguments: { label: 'Still editing B' } })
+      expect(edit.isError).toBeFalsy()
+      expect(second.trackLabels()).toContain('Still editing B')
+    } finally {
+      await Promise.all([a.client.close(), b.client.close()])
+      first.agent.stop()
+      second.agent.stop()
+    }
+  })
+})
 
 /** The rows arrive from SDK callbacks a microtask or two behind the HTTP
  *  response, so wait on the row rather than on the reply. */

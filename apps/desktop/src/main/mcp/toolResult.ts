@@ -43,6 +43,8 @@ export class UnknownToolError extends Error {
 export const NO_PROJECT_OPEN_MESSAGE =
   'No project is open in WeftCut — the app is on its start screen. If the user asked for a particular project, open it with open_project (read_project { view: "session" } lists recent_projects) or make it with create_project; otherwise ask the user which project to work in. Nothing was changed.'
 
+export const PROJECT_CLOSED_MESSAGE = 'The target project is no longer open. Connect using its current project endpoint.'
+
 export function noProjectOpenResult(): ServerResult {
   return toolErrorResult({ code: 'invalid_request', message: NO_PROJECT_OPEN_MESSAGE, data: { error: 'NoProjectOpen' } })
 }

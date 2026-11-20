@@ -43,7 +43,7 @@ import type { MediaItem } from '../state/model.js'
 import type { ActorHandle, ChangeEvent } from '../state/actor.js'
 import { mergeMcpCatalog, mergeMcpResources } from './mcpCatalog.js'
 import { MCP_TOOL_DEFS, MCP_TOOLS, McpArgError, mcpDef, type McpErrorCode, type McpToolErrorJson, type ToolAnnotations } from '../state/mcp-commands.js'
-import { NO_PROJECT_OPEN_MESSAGE, noProjectOpenResult, toolErrorResult, thrownToToolError, UnknownToolError } from './toolResult.js'
+import { NO_PROJECT_OPEN_MESSAGE, PROJECT_CLOSED_MESSAGE, noProjectOpenResult, toolErrorResult, thrownToToolError, UnknownToolError } from './toolResult.js'
 import { toolRecord } from '../state/mcp-results.js'
 import { mcpActor, normalizeClientName } from '../state/mcp-actor.js'
 import { libraryHost } from '../../shared/motifs/projectMotifs.js'
@@ -58,7 +58,7 @@ import { isSkillUri, readSkillResource, readSkillView, skillResourceDefs } from 
 import { mcpInstructions } from './instructions.js'
 import { AgentServiceError } from '../agent/activity.js'
 import { effectsCatalogView } from '../../shared/effects/catalogView.js'
-import { withLog, NO_MCP_LOG, type McpCommitWindow, type McpLogDeps, type McpRowSummary } from './withLog.js'
+import { withLog, NO_MCP_LOG, type McpCommitWindow, type McpLogDeps, type McpLoggedMethod, type McpRowSummary } from './withLog.js'
 import { TACK_TOOLS, isTacksUri, readTacksResource, readTacksView, runTackTool } from './tackTools.js'
 import { heldForAudit } from '../lint/audits.js'
 import { ComputeCancelledError, type ComputeCaller } from '../compute/jobs.js'
@@ -1135,6 +1135,7 @@ export interface McpServerOptions {
   /** The companion page's link, key included, that `open_side_preview` answers
    *  with; `startMcpHost` builds it from its own URL. Omitted → refused. */
   companionLink?: string
+  projectAvailable?: () => boolean
 }
 
 export function buildMcpServer(backend: Backend, opts: McpServerOptions = {}): Server {
@@ -1163,6 +1164,11 @@ export function buildMcpServer(backend: Backend, opts: McpServerOptions = {}): S
   const clientInfo = (): { name: string; version?: string } | undefined => server.getClientVersion()
 
   const connectionId = opts.connectionId ?? randomUUID()
+  const projectClosed = (method: McpLoggedMethod): ServerResult => {
+    const data = { error: 'ProjectClosed' }
+    if (method === 'tools/call') return toolErrorResult({ code: 'invalid_request', message: PROJECT_CLOSED_MESSAGE, data })
+    throw new McpError(ErrorCode.InvalidRequest, PROJECT_CLOSED_MESSAGE, data)
+  }
   // Read or write is the catalog's own `readOnlyHint` — the one statement of
   // the split, so the agent panel's read rows and the annotations a
   // client sees cannot disagree. A non-tool method (a list, a resource read)
@@ -1170,11 +1176,13 @@ export function buildMcpServer(backend: Backend, opts: McpServerOptions = {}): S
   // operation and refused as unknown by the dispatcher. Resolved on the first
   // tracked call, not at build: a host without an agent service never asks.
   const track: typeof withLog = (method, handler, deps, client) => withLog(method, async (req, extra) => {
+    if (opts.projectAvailable?.() === false) return projectClosed(method)
     const service = getTsHost()?.agent
     if (!service) return handler(req, extra)
     const params = (req.params ?? {}) as Record<string, unknown>
     const tool = method === 'tools/call' ? String(params.name ?? '') : method
     const read = method !== 'tools/call' || (await readOnlyTools(backend)).has(tool)
+    if (opts.projectAvailable?.() === false) return projectClosed(method)
     return service.run(connectionId, clientInfo()?.name ?? 'MCP', tool,
       method === 'tools/call' ? params.arguments ?? {} : params, read, () => handler(req, extra))
   }, deps, client)
@@ -1191,6 +1199,13 @@ export function buildMcpServer(backend: Backend, opts: McpServerOptions = {}): S
   // Synchronous, so the LANDMINE in `handleCallTool` holds.
   const callTool = track('tools/call', async (req: CallToolRequest, extra: unknown) => {
     const name = req.params.name
+    if (opts.projectAvailable && PROJECT_TOOLS.has(name)) {
+      return toolErrorResult({
+        code: 'invalid_request',
+        message: 'This connection is bound to an open project. Open or create another project from the editor or the app endpoint.',
+        data: { error: 'ProjectConnectionBound' },
+      })
+    }
     const client = clientInfo()?.name
     const compute = COMPUTE_TOOLS.has(name)
       ? mcpComputeCaller({ extra, client: client ?? 'MCP', closed: () => server.transport === undefined, onPhase: activityPhase(getTsHost) })

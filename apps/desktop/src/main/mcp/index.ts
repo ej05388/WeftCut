@@ -9,8 +9,10 @@ import { buildMcpServer, type McpServerOptions } from './server.js'
 import { loadOrInitAuth, saveAuth, rotateToken, type McpAuth } from './auth.js'
 import { listenLoopback, loopbackHosts } from './bind.js'
 import { NO_MCP_LOG, type McpLogEntryInput } from './withLog.js'
+import { PROJECT_CLOSED_MESSAGE } from './toolResult.js'
 import type { AgentConnection, AgentConnectionSnapshot } from '../../shared/agent-activity.js'
 import type { CompanionRouteDeps } from '../companion/routes.js'
+import type { TsActorHost } from '../state/ts-actor-host.js'
 
 type Backend = import('@weftcut/core').Backend
 
@@ -24,7 +26,9 @@ export interface McpHost {
   getInfo(): McpInfoView
   connectionSnapshot(): AgentConnectionSnapshot
   resetToken(): string
-  /** notifications/resources/list_changed to every session. */
+  /** The backend and actor must belong to this project opening for the endpoint's lifetime. */
+  registerProject(backend: Backend, host: TsActorHost, options?: ProjectMcpOptions): ProjectMcpEndpoint
+  /** notifications/resources/list_changed to sessions on the app endpoint. */
   notifyResourceListChanged(): void
   close(): Promise<void>
 }
@@ -62,17 +66,28 @@ export interface McpHostCompanion {
 }
 
 /** Host-level seams, forwarded verbatim to every per-session `buildMcpServer`. */
-export type McpHostOptions = Omit<McpServerOptions, 'companionLink'> & {
+export type McpHostOptions = Omit<McpServerOptions, 'companionLink' | 'projectAvailable'> & {
   sessionReaper?: SessionReaperOptions
   companion?: McpHostCompanion
 }
+
+type ProjectMcpOptions = Omit<McpServerOptions, 'companionLink' | 'connectionId' | 'getTsHost' | 'projectAvailable' | 'version'>
+
+export interface ProjectMcpEndpoint {
+  getInfo(): McpInfoView
+  connectionSnapshot(): AgentConnectionSnapshot
+  notifyResourceListChanged(): void
+  close(): Promise<void>
+}
+
+type ProjectRoute = { backend: Backend; host: TsActorHost; options: ProjectMcpOptions }
 
 export async function startMcpHost(backend: Backend, opts: McpHostOptions = {}): Promise<McpHost> {
   let auth: McpAuth = loadOrInitAuth()
   // package.json's version, which is what every session reports in `initialize`.
   const version = opts.version ?? app.getVersion()
-  const transports = new Map<string, StreamableHTTPServerTransport>()
-  const servers = new Set<Server>()
+  const projects = new Map<string, ProjectRoute>()
+  const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: Server; projectId: string | undefined }>()
   const connections = new Map<string, AgentConnection>()
   /** Per session: whether its standalone SSE stream is open, when that last
    *  changed, and when the last request arrived — the liveness the reaper below
@@ -97,9 +112,10 @@ export async function startMcpHost(backend: Backend, opts: McpHostOptions = {}):
     source: McpLogEntryInput['source'],
     message: string,
     details?: Record<string, unknown>,
+    sink = log,
   ): void => {
     try {
-      log.emit({ level, category: { kind: 'Mcp' }, source, message, ...(details ? { details } : {}) })
+      sink.emit({ level, category: { kind: 'Mcp' }, source, message, ...(details ? { details } : {}) })
     } catch (err) {
       console.error('[mcp] lifecycle log emit failed', err)
     }
@@ -142,10 +158,19 @@ export async function startMcpHost(backend: Backend, opts: McpHostOptions = {}):
     rejected: (details) => emitLifecycle('warn', { kind: 'System' }, 'Companion request rejected', details),
   })
 
-  appExpress.all('/mcp', async (req, res) => {
+  appExpress.all(['/mcp', '/mcp/projects/:projectId'], async (req, res) => {
+    const projectId = typeof req.params.projectId === 'string' ? req.params.projectId : undefined
+    const project = projectId === undefined ? undefined : projects.get(projectId)
+    const projectClosed = () => res.status(404).json({
+      jsonrpc: '2.0', error: { code: -32000, message: PROJECT_CLOSED_MESSAGE, data: { error: 'ProjectClosed' } }, id: null,
+    })
+    if (projectId !== undefined && project === undefined) {
+      projectClosed()
+      return
+    }
     const sid = req.headers['mcp-session-id'] as string | undefined
-    let transport = sid ? transports.get(sid) : undefined
-    if (transport) {
+    const session = sid ? sessions.get(sid) : undefined
+    if (session && session.projectId === projectId) {
       const client = connections.get(sid!)
       if (client) client.last_activity_at = new Date().toISOString()
       const live = streams.get(sid!)
@@ -172,17 +197,22 @@ export async function startMcpHost(backend: Backend, opts: McpHostOptions = {}):
         })
       }
       // Existing session — route straight through.
-      await transport.handleRequest(req, res, req.body)
+      await session.transport.handleRequest(req, res, req.body)
       return
     }
     // No usable existing transport: only allow a fresh initialize request.
     if (!sid && isInitializeRequest(req.body)) {
       const connectionId = randomUUID()
-      let newServer: Server | undefined
-      transport = new StreamableHTTPServerTransport({
+      const getTsHost = project ? () => project.host : opts.getTsHost
+      const sessionLog = project ? project.options.log ?? NO_MCP_LOG : log
+      const projectAvailable = () => projectId === undefined || projects.get(projectId) === project
+      const newServer = buildMcpServer(project?.backend ?? backend, {
+        ...(project?.options ?? opts), ...(getTsHost ? { getTsHost } : {}), connectionId, version,
+        ...(projectId !== undefined ? { projectAvailable } : companionLink === null ? {} : { companionLink }),
+      })
+      const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => connectionId,
         onsessioninitialized: (id) => {
-          transports.set(id, transport!)
           streams.set(id, { state: 'never', changedAt: Date.now(), lastRequestAt: Date.now(), openToken: 0 })
         },
         // DNS-rebinding defense-in-depth: a malicious web page the user visits
@@ -193,15 +223,15 @@ export async function startMcpHost(backend: Backend, opts: McpHostOptions = {}):
         allowedHosts: loopbackHosts(port),
       })
       transport.onclose = () => {
-        const sessionId = transport!.sessionId
-        if (sessionId) { transports.delete(sessionId); streams.delete(sessionId) }
-        if (newServer) servers.delete(newServer)
+        const sessionId = transport.sessionId
+        streams.delete(connectionId)
+        sessions.delete(connectionId)
         connections.delete(connectionId)
-        opts.getTsHost?.()?.agent?.end('disconnected', connectionId)
+        getTsHost?.()?.agent?.end('disconnected', connectionId)
         // `Debug`, not `Info`: a client reconnecting is routine, and at `Info` it
         // would flood the console's default filter.
         emitLifecycle('debug', { kind: 'System' }, 'MCP client disconnected',
-          sessionId ? { session_id: sessionId } : undefined)
+          sessionId ? { session_id: sessionId } : undefined, sessionLog)
       }
       // Set BEFORE connect, for two reasons. `Protocol.connect` CHAINS an
       // existing onerror/onclose rather than replacing it, so ours has to be
@@ -219,36 +249,45 @@ export async function startMcpHost(backend: Backend, opts: McpHostOptions = {}):
         // `Invalid Origin header:` path is unreachable: `allowedOrigins` is
         // deliberately left unset (see the transport options above).
         if (detail.startsWith('Invalid Host header:')) {
-          emitLifecycle('warn', { kind: 'System' }, 'MCP request rejected: host not allowed', { error: detail })
+          emitLifecycle('warn', { kind: 'System' }, 'MCP request rejected: host not allowed', { error: detail }, sessionLog)
           return
         }
         // `onerror` is a superset hook — the transport reports every protocol
         // fault through it (unacceptable Accept, unparseable JSON, unknown
         // session). Its own row, so a rejected Host is never inferred from one
         // of those. `Warn`, not `Error`: the request failed, the app did not.
-        emitLifecycle('warn', { kind: 'System' }, 'MCP transport error', { error: detail })
+        emitLifecycle('warn', { kind: 'System' }, 'MCP transport error', { error: detail }, sessionLog)
       }
-      newServer = buildMcpServer(backend, { ...opts, connectionId, version, ...(companionLink === null ? {} : { companionLink }) })
-      servers.add(newServer)
       // `getClientVersion()` is populated while the `initialize` REQUEST is
       // handled, which precedes the `notifications/initialized` that fires this
       // — so the row carries the real agent name, not `undefined`.
       newServer.oninitialized = () => {
-        const client = newServer!.getClientVersion()
+        if (!sessions.has(connectionId) || !projectAvailable()) return
+        const client = newServer.getClientVersion()
         const now = new Date().toISOString()
         connections.set(connectionId, { id: connectionId, client: client?.name ?? 'MCP', version: client?.version ?? '', connected_at: now, last_activity_at: now })
         const who = client ? `${client.name}/${client.version ?? '?'}` : 'unknown'
         emitLifecycle('info', { kind: 'System' }, `MCP client connected: ${who}`, {
           ...(client ? { client_info: client } : {}),
-          ...(transport!.sessionId ? { session_id: transport!.sessionId } : {}),
-        })
+          ...(transport.sessionId ? { session_id: transport.sessionId } : {}),
+        }, sessionLog)
       }
       // Cast: the SDK declares Transport.onclose as a getter typed
       // `(() => void) | undefined`, which TS won't accept against the optional
       // `onclose?: () => void` of the `Transport` interface under
       // `exactOptionalPropertyTypes`. Runtime-compatible; narrow to Transport.
       await newServer.connect(transport as Transport)
-      await transport.handleRequest(req, res, req.body)
+      if (!available || !projectAvailable()) {
+        await transport.close()
+        projectClosed()
+        return
+      }
+      sessions.set(connectionId, { transport, server: newServer, projectId })
+      try {
+        await transport.handleRequest(req, res, req.body)
+      } finally {
+        if (!transport.sessionId) await transport.close()
+      }
       return
     }
     // Non-init request with no/stale session — reject without allocating.
@@ -262,7 +301,7 @@ export async function startMcpHost(backend: Backend, opts: McpHostOptions = {}):
   // host with no clients never keeps the process alive on its own.
   const sweep = (): void => {
     const now = Date.now()
-    for (const [sid, transport] of transports) {
+    for (const [sid, { transport, projectId }] of sessions) {
       const stream = streams.get(sid)
       if (!stream) continue
       const idleMs = now - stream.lastRequestAt
@@ -274,7 +313,7 @@ export async function startMcpHost(backend: Backend, opts: McpHostOptions = {}):
       if (!gone) continue
       emitLifecycle('info', { kind: 'System' }, 'MCP client gone: session closed', {
         session_id: sid, client: connections.get(sid)?.client ?? null, reason: stream.state === 'closed' ? 'stream_closed' : 'idle', idle_ms: idleMs,
-      })
+      }, projectId === undefined ? log : projects.get(projectId)?.options.log ?? NO_MCP_LOG)
       // Best-effort: a transport already half-closed must not stop the sweep.
       transport.close().catch(() => {})
     }
@@ -307,13 +346,25 @@ export async function startMcpHost(backend: Backend, opts: McpHostOptions = {}):
     )
   }
 
+  const info = (endpoint: string): McpInfoView => ({ bind: `127.0.0.1:${port}`, url: endpoint, bearer_token: auth.token })
+  const snapshot = (endpoint: string, active: boolean, projectId?: string): AgentConnectionSnapshot => ({
+    available: active, url: endpoint,
+    connections: [...connections.values()].filter(c => sessions.get(c.id)?.projectId === projectId),
+  })
+  const notify = (projectId?: string): void => {
+    for (const session of sessions.values()) {
+      if (session.projectId === projectId) session.server.sendResourceListChanged().catch(() => {})
+    }
+  }
+  const closeSessions = async (projectId?: string) => {
+    await Promise.all([...sessions.values()]
+      .filter(session => projectId === undefined || session.projectId === projectId)
+      .map(({ transport }) => transport.close().catch(() => {})))
+  }
+
   return {
-    connectionSnapshot(): AgentConnectionSnapshot {
-      return { available, url, connections: [...connections.values()] }
-    },
-    getInfo(): McpInfoView {
-      return { bind: `127.0.0.1:${port}`, url, bearer_token: auth.token }
-    },
+    connectionSnapshot: () => snapshot(url, available),
+    getInfo: () => info(url),
     resetToken(): string {
       auth = rotateToken(auth)
       // `source = User`: the one lifecycle row a person causes rather than a
@@ -321,13 +372,27 @@ export async function startMcpHost(backend: Backend, opts: McpHostOptions = {}):
       emitLifecycle('info', { kind: 'User' }, 'MCP bearer token rotated')
       return auth.token
     },
-    notifyResourceListChanged(): void {
-      for (const server of servers) server.sendResourceListChanged().catch(() => { /* session may have closed */ })
+    registerProject(projectBackend, host, options = {}) {
+      if (!available) throw new Error('MCP host is closed')
+      const id = randomUUID()
+      const endpoint = `${url}/projects/${id}`
+      projects.set(id, { backend: projectBackend, host, options })
+      return {
+        getInfo: () => info(endpoint),
+        connectionSnapshot: () => snapshot(endpoint, available && projects.has(id), id),
+        notifyResourceListChanged: () => notify(id),
+        async close() {
+          projects.delete(id)
+          await closeSessions(id)
+        },
+      }
     },
+    notifyResourceListChanged: () => notify(),
     async close(): Promise<void> {
       available = false
+      projects.clear()
       clearInterval(sweeper)
-      for (const t of transports.values()) await t.close().catch(() => {})
+      await closeSessions()
       http.close()
     },
   }
